@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "morfah-studios-ott",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-26",
+  "assets": {
+    "directory": "./out",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "morfah-ott-db",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "migrations_dir": "./migrations"
+    }
+  ],
+  "vars": {
+    "TELEGRAM_CHANNEL_ID": "-1004427906462"
+  }
+}
