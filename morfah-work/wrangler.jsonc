@@ -12,7 +12,7 @@
     {
       "binding": "DB",
       "database_name": "morfah-ott-db",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "database_id": "0cf33008-a668-49ca-b2fd-b28ab3a67faf",
       "migrations_dir": "./migrations"
     }
   ],
