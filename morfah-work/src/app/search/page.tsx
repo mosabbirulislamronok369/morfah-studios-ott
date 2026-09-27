@@ -22,7 +22,7 @@ export default function SearchPage() {
       <div className="search-top"><input autoFocus className="search-input" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search series..." /></div>
       <div className="search-results">
         {results.map((series) => <Link className="search-result" key={series.id} href={`/series?id=${encodeURIComponent(series.id)}`}>
-          <img src={series.poster} alt={series.title} /><div><strong>{series.title}</strong><div className="muted">{series.episodes.length} Episodes</div></div>
+          <img src={series.poster} alt={series.title} /><div><strong>{series.title}</strong><div className="muted">{series.episodeCount ?? series.episodes.length} Episodes</div></div>
         </Link>)}
         {q && !results.length && <div className="muted">কোনো সিরিজ পাওয়া যায়নি।</div>}
       </div>

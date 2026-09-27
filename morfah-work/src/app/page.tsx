@@ -28,7 +28,7 @@ export default function HomePage() {
           <h1>{featured.title}</h1>
           <div className="meta">
             {featured.year && <span>{featured.year}</span>}
-            <span>{featured.episodes.length} Episodes</span>
+            <span>{featured.episodeCount ?? featured.episodes.length} Episodes</span>
             {featured.genre.map((g) => <span className="pill" key={g}>{g}</span>)}
           </div>
           <p>{featured.description}</p>

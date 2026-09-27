@@ -18,6 +18,7 @@ export type Series = {
   backdrop?: string;
   featured?: boolean;
   episodes: Episode[];
+  episodeCount?: number;
 };
 
 export const fallbackCatalog: Series[] = [

@@ -6,7 +6,7 @@ export function SeriesCard({ series }: { series: Series }) {
     <Link className="card" href={`/series?id=${encodeURIComponent(series.id)}`}>
       <img className="poster" src={series.poster} alt={series.title} />
       <div className="card-title">{series.title}</div>
-      <div className="card-meta">{series.year ?? ""}{series.year ? " · " : ""}{series.episodes.length} Episodes</div>
+      <div className="card-meta">{series.year ?? ""}{series.year ? " · " : ""}{series.episodeCount ?? series.episodes.length} Episodes</div>
     </Link>
   );
 }
