@@ -11,6 +11,26 @@ interface Env {
   TELEGRAM_INVITE_LINK?: string;
 }
 
+type TelegramPhotoSize = {
+  file_id: string;
+  file_unique_id?: string;
+  width?: number;
+  height?: number;
+  file_size?: number;
+};
+
+type TelegramMedia = {
+  file_id?: string;
+  file_unique_id?: string;
+
+  // Telegram Bot API 8.3+: custom/message-specific video cover.
+  // This is preferred over the generated video thumbnail.
+  cover?: TelegramPhotoSize[];
+
+  thumbnail?: TelegramPhotoSize;
+  thumb?: TelegramPhotoSize;
+};
+
 type TelegramPost = {
   message_id: number;
 
@@ -23,9 +43,11 @@ type TelegramPost = {
 
   caption?: string;
 
-  video?: unknown;
-  document?: unknown;
-  animation?: unknown;
+  photo?: TelegramPhotoSize[];
+
+  video?: TelegramMedia;
+  document?: TelegramMedia;
+  animation?: TelegramMedia;
 };
 
 type TelegramUpdate = {
@@ -258,6 +280,151 @@ function parseCaption(
   };
 }
 
+function getTelegramThumbnailFileId(
+  post: TelegramPost
+): string | null {
+  // 1) Prefer the custom/message-specific video cover selected
+  //    when the video was posted to Telegram.
+  const videoCover =
+    post.video?.cover?.[0]?.file_id;
+
+  if (videoCover) {
+    return videoCover;
+  }
+
+  // 2) Fallback to Telegram's generated video thumbnail.
+  // A separate cover-photo update is handled in the webhook. 
+  const videoThumbnail =
+    post.video?.thumbnail?.file_id ||
+    post.video?.thumb?.file_id;
+
+  if (videoThumbnail) {
+    return videoThumbnail;
+  }
+
+  // 3) Document thumbnail fallback.
+  const documentThumbnail =
+    post.document?.thumbnail?.file_id ||
+    post.document?.thumb?.file_id;
+
+  if (documentThumbnail) {
+    return documentThumbnail;
+  }
+
+  // 4) Animation thumbnail fallback.
+  const animationThumbnail =
+    post.animation?.thumbnail?.file_id ||
+    post.animation?.thumb?.file_id;
+
+  if (animationThumbnail) {
+    return animationThumbnail;
+  }
+
+  // 5) Fallback: Telegram photo post.
+  if (post.photo && post.photo.length > 0) {
+    const largest =
+      post.photo[post.photo.length - 1];
+
+    return largest?.file_id ?? null;
+  }
+
+  return null;
+}
+
+/* =========================================================
+   TELEGRAM CUSTOM COVER PHOTO
+
+   Telegram may deliver a manually selected video cover as a
+   separate channel photo update immediately after the video.
+   When the photo message directly follows an imported video
+   message, use the highest-resolution photo as the SERIES poster.
+   Once saved, later episodes keep that same series poster unless
+   a caption explicitly provides a new Poster: value.
+========================================================= */
+
+async function applyTelegramCoverPhoto(
+  env: Env,
+  post: TelegramPost
+) {
+  const configuredChannel = String(
+    env.TELEGRAM_CHANNEL_ID || ""
+  ).trim();
+
+  const incomingChannel = String(
+    post.chat?.id ?? ""
+  ).trim();
+
+  if (
+    configuredChannel &&
+    incomingChannel !== configuredChannel
+  ) {
+    return {
+      matched: false,
+      reason: "wrong_channel",
+    };
+  }
+
+  if (!post.photo?.length || !post.message_id) {
+    return {
+      matched: false,
+      reason: "not_a_photo_post",
+    };
+  }
+
+  const previousMessageId =
+    post.message_id - 1;
+
+  const episode =
+    await env.DB.prepare(`
+      SELECT series_id
+      FROM episodes
+      WHERE telegram_message_id = ?
+      LIMIT 1
+    `)
+      .bind(previousMessageId)
+      .first<{ series_id: string }>();
+
+  if (!episode?.series_id) {
+    return {
+      matched: false,
+      reason: "no_previous_video_episode",
+    };
+  }
+
+  const largestPhoto =
+    post.photo[post.photo.length - 1];
+
+  if (!largestPhoto?.file_id) {
+    return {
+      matched: false,
+      reason: "photo_file_id_missing",
+    };
+  }
+
+  const poster =
+    `/api/telegram/poster/${encodeURIComponent(
+      largestPhoto.file_id
+    )}`;
+
+  await env.DB.prepare(`
+    UPDATE series
+    SET poster = ?,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `)
+    .bind(
+      poster,
+      episode.series_id
+    )
+    .run();
+
+  return {
+    matched: true,
+    seriesId: episode.series_id,
+    coverMessageId: post.message_id,
+    sourceMessageId: previousMessageId,
+  };
+}
 
 /* =========================================================
    TELEGRAM URL
@@ -267,26 +434,18 @@ function telegramUrl(
   env: Env,
   post: TelegramPost
 ) {
-  if (env.TELEGRAM_INVITE_LINK) {
-    return env.TELEGRAM_INVITE_LINK;
-  }
+  const id = post.message_id;
+  const chatId = String(post.chat?.id ?? "");
 
-  const id =
-    post.message_id;
-
-  const chatId =
-    String(
-      post.chat?.id ?? ""
-    );
-
-  if (post.chat?.username) {
+  if (post.chat?.username && id) {
     return `https://t.me/${post.chat.username}/${id}`;
   }
 
-  return `https://t.me/c/${chatId.replace(
-    /^-100/,
-    ""
-  )}/${id}`;
+  if (chatId && id) {
+    return `https://t.me/c/${chatId.replace(/^\-100/, "")}/${id}`;
+  }
+
+  return env.TELEGRAM_INVITE_LINK || "https://t.me/";
 }
 
 
@@ -407,7 +566,6 @@ async function catalog(
         ON e.series_id = s.id
       GROUP BY s.id
       ORDER BY
-        s.featured DESC,
         s.updated_at DESC,
         s.title ASC
     `)
@@ -618,7 +776,6 @@ async function searchCatalog(
         ) LIKE ?
       GROUP BY s.id
       ORDER BY
-        s.featured DESC,
         s.updated_at DESC,
         s.title ASC
       LIMIT 50
@@ -772,9 +929,26 @@ async function importPost(
       )
     );
 
+ const telegramThumbnailFileId =
+  getTelegramThumbnailFileId(post);
+
+const telegramThumbnail =
+  telegramThumbnailFileId
+    ? `/api/telegram/poster/${encodeURIComponent(
+        telegramThumbnailFileId
+      )}`
+    : null;
+
+// Series poster priority:
+  // 1) Explicit Poster: from the caption, if supplied.
+  // 2) Existing series poster: keeps ONE poster across all episodes.
+  // 3) Telegram video cover/thumbnail: used only when the series
+  //    does not already have a poster.
+  // 4) Default poster fallback.
   const poster =
     parsed.poster ||
     existing?.poster ||
+    telegramThumbnail ||
     DEFAULT_POSTER;
 
   const backdrop =
@@ -795,6 +969,10 @@ async function importPost(
   const featured =
     existing?.featured ??
     0;
+
+  /* =======================================================
+     UPSERT SERIES / CONTENT
+  ======================================================= */
 
   await env.DB.prepare(`
     INSERT INTO series (
@@ -853,31 +1031,25 @@ async function importPost(
   `)
     .bind(
       seriesId,
-
       parsed.series,
-
       existing?.original_title ||
         null,
-
       description,
-
       year,
-
       genreJson,
-
       poster,
-
       backdrop,
-
       featured,
-
       parsed.type
     )
     .run();
 
-
   /* =======================================================
      MOVIE / SHORT NATOK
+
+     IMPORTANT:
+     episodes table requires telegram_message_id.
+     episodes table does NOT have updated_at.
   ======================================================= */
 
   if (
@@ -897,8 +1069,8 @@ async function importPost(
         telegram_url,
         youtube_url,
         facebook_url,
-        created_at,
-        updated_at
+        telegram_message_id,
+        created_at
       )
       VALUES (
         ?,
@@ -908,7 +1080,7 @@ async function importPost(
         ?,
         ?,
         ?,
-        CURRENT_TIMESTAMP,
+        ?,
         CURRENT_TIMESTAMP
       )
       ON CONFLICT(id)
@@ -919,43 +1091,34 @@ async function importPost(
         telegram_url =
           excluded.telegram_url,
 
-        updated_at =
-          CURRENT_TIMESTAMP
+        telegram_message_id =
+          excluded.telegram_message_id
     `)
       .bind(
         contentId,
-
         seriesId,
-
         1,
-
         parsed.title,
-
         telegramUrl(
           env,
           post
         ),
-
         null,
-
-        null
+        null,
+        post.message_id
       )
       .run();
 
     return {
       imported: true,
-
       type:
         parsed.type,
-
       id:
         seriesId,
-
       title:
         parsed.title,
     };
   }
-
 
   /* =======================================================
      SERIES EPISODE
@@ -985,8 +1148,8 @@ async function importPost(
       telegram_url,
       youtube_url,
       facebook_url,
-      created_at,
-      updated_at
+      telegram_message_id,
+      created_at
     )
     VALUES (
       ?,
@@ -996,7 +1159,7 @@ async function importPost(
       ?,
       ?,
       ?,
-      CURRENT_TIMESTAMP,
+      ?,
       CURRENT_TIMESTAMP
     )
     ON CONFLICT(id)
@@ -1007,40 +1170,31 @@ async function importPost(
       telegram_url =
         excluded.telegram_url,
 
-      updated_at =
-        CURRENT_TIMESTAMP
+      telegram_message_id =
+        excluded.telegram_message_id
   `)
     .bind(
       episodeId,
-
       seriesId,
-
       episode,
-
       parsed.title ||
         `${parsed.series} Episode - ${episode}`,
-
       telegramUrl(
         env,
         post
       ),
-
       null,
-
-      null
+      null,
+      post.message_id
     )
     .run();
 
   return {
     imported: true,
-
     type:
       "series",
-
     seriesId,
-
     episode,
-
     title:
       parsed.title ||
       `${parsed.series} Episode - ${episode}`,
@@ -1353,6 +1507,104 @@ export default {
 
 
       /* =====================================================
+         TELEGRAM POSTER PROXY
+
+         Uses the Telegram file_id stored in series.poster.
+      ===================================================== */
+
+      if (
+        request.method === "GET" &&
+        path.startsWith("/api/telegram/poster/")
+      ) {
+        const rawFileId = path.slice(
+          "/api/telegram/poster/".length
+        );
+
+        const fileId = decodeURIComponent(
+          rawFileId
+        );
+
+        if (!fileId) {
+          return json(
+            {
+              ok: false,
+              error:
+                "Telegram file_id is required",
+            },
+            400
+          );
+        }
+
+        const fileInfo =
+          (await telegramApi(
+            env,
+            "getFile",
+            {
+              file_id: fileId,
+            }
+          )) as {
+            ok?: boolean;
+            result?: {
+              file_path?: string;
+            };
+          };
+
+        const filePath =
+          fileInfo?.ok &&
+          fileInfo?.result?.file_path;
+
+        if (!filePath) {
+          return json(
+            {
+              ok: false,
+              error:
+                "Telegram poster file not found",
+            },
+            404
+          );
+        }
+
+        const imageResponse =
+          await fetch(
+            `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`
+          );
+
+        if (!imageResponse.ok) {
+          return json(
+            {
+              ok: false,
+              error:
+                "Failed to download Telegram poster",
+            },
+            502
+          );
+        }
+
+        const headers = new Headers();
+
+        headers.set(
+          "content-type",
+          imageResponse.headers.get(
+            "content-type"
+          ) || "image/jpeg"
+        );
+
+        headers.set(
+          "cache-control",
+          "public, max-age=86400, s-maxage=86400"
+        );
+
+        return new Response(
+          imageResponse.body,
+          {
+            status: 200,
+            headers,
+          }
+        );
+      }
+
+
+      /* =====================================================
          TELEGRAM WEBHOOK POST
       ===================================================== */
 
@@ -1390,6 +1642,25 @@ export default {
             reason:
               "no_channel_post",
           });
+        }
+
+        // A manually selected Telegram video cover may arrive
+        // as a separate photo update immediately after the video.
+        if (post.photo?.length) {
+          const coverResult =
+            await applyTelegramCoverPhoto(
+              env,
+              post
+            );
+
+          if (coverResult.matched) {
+            return json({
+              ok: true,
+              imported: false,
+              coverUpdated: true,
+              ...coverResult,
+            });
+          }
         }
 
         const result =
