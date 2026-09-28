@@ -1,3 +1,5 @@
+export type ContentType = "series" | "movie" | "short_natok";
+
 export type Episode = {
   id: string;
   number: number;
@@ -17,8 +19,12 @@ export type Series = {
   poster: string;
   backdrop?: string;
   featured?: boolean;
-  episodes: Episode[];
+
+  // এই line-টাই গুরুত্বপূর্ণ
+  contentType?: ContentType;
+
   episodeCount?: number;
+  episodes: Episode[];
 };
 
 export const fallbackCatalog: Series[] = [
