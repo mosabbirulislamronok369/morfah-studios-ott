@@ -86,6 +86,8 @@ type ParsedCaption = {
   backdrop?: string;
 
   description?: string;
+  youtube?: string;
+  facebook?: string;
 };
 
 const DEFAULT_POSTER =
@@ -221,6 +223,12 @@ function parseCaption(
   const description =
     get("Description");
 
+  const youtube =
+    get("YouTube");
+
+  const facebook =
+    get("Facebook");
+
   const parsedEpisode =
     Number.parseInt(
       episodeRaw,
@@ -277,6 +285,10 @@ function parseCaption(
     backdrop,
 
     description,
+
+    youtube,
+
+    facebook,
   };
 }
 
@@ -1092,7 +1104,13 @@ const telegramThumbnail =
           excluded.telegram_url,
 
         telegram_message_id =
-          excluded.telegram_message_id
+          excluded.telegram_message_id,
+
+        youtube_url =
+          excluded.youtube_url,
+
+        facebook_url =
+          excluded.facebook_url
     `)
       .bind(
         contentId,
@@ -1103,8 +1121,8 @@ const telegramThumbnail =
           env,
           post
         ),
-        null,
-        null,
+        parsed.youtube || null,
+        parsed.facebook || null,
         post.message_id
       )
       .run();
@@ -1183,8 +1201,8 @@ const telegramThumbnail =
         env,
         post
       ),
-      null,
-      null,
+      parsed.youtube || null,
+      parsed.facebook || null,
       post.message_id
     )
     .run();
