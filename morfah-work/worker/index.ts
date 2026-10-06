@@ -66,7 +66,9 @@ type EpisodeRow = {
 type ContentType =
   | "series"
   | "movie"
-  | "short_natok";
+  | "short_natok"
+  | "vlog"
+  | "trailer";
 
 type ParsedCaption = {
   type: ContentType;
@@ -194,6 +196,10 @@ function parseCaption(
     typeRaw === "short-natok"
   ) {
     type = "short_natok";
+  } else if (typeRaw === "vlog") {
+    type = "vlog";
+  } else if (typeRaw === "trailer") {
+    type = "trailer";
   }
 
   const series =
@@ -386,23 +392,6 @@ async function applyTelegramCoverPhoto(
   const previousMessageId =
     post.message_id - 1;
 
-  const episode =
-    await env.DB.prepare(`
-      SELECT series_id
-      FROM episodes
-      WHERE telegram_message_id = ?
-      LIMIT 1
-    `)
-      .bind(previousMessageId)
-      .first<{ series_id: string }>();
-
-  if (!episode?.series_id) {
-    return {
-      matched: false,
-      reason: "no_previous_video_episode",
-    };
-  }
-
   const largestPhoto =
     post.photo[post.photo.length - 1];
 
@@ -417,6 +406,55 @@ async function applyTelegramCoverPhoto(
     `/api/telegram/poster/${encodeURIComponent(
       largestPhoto.file_id
     )}`;
+
+  // A photo immediately after a content video can be the custom
+  // poster/cover for that content item.
+  const content =
+    await env.DB.prepare(`
+      SELECT id
+      FROM content
+      WHERE telegram_message_id = ?
+      LIMIT 1
+    `)
+      .bind(previousMessageId)
+      .first<{ id: string }>();
+
+  if (content?.id) {
+    await env.DB.prepare(`
+      UPDATE content
+      SET poster = ?,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `)
+      .bind(poster, content.id)
+      .run();
+
+    return {
+      matched: true,
+      contentId: content.id,
+      coverMessageId: post.message_id,
+      sourceMessageId: previousMessageId,
+    };
+  }
+
+  // Existing Series behavior: a following photo becomes the
+  // series poster and is shared across the series.
+  const episode =
+    await env.DB.prepare(`
+      SELECT series_id
+      FROM episodes
+      WHERE telegram_message_id = ?
+      LIMIT 1
+    `)
+      .bind(previousMessageId)
+      .first<{ series_id: string }>();
+
+  if (!episode?.series_id) {
+    return {
+      matched: false,
+      reason: "no_previous_content_or_video",
+    };
+  }
 
   await env.DB.prepare(`
     UPDATE series
@@ -642,6 +680,106 @@ async function catalog(
           ),
       })
     )
+  );
+}
+
+
+/* =========================================================
+   CONTENT CATALOG
+   ========================================================= */
+
+async function contentCatalog(
+  env: Env,
+  type?: string
+) {
+  const normalizedType =
+    type?.trim().toLowerCase() || "";
+
+  const query = normalizedType
+    ? `
+      SELECT
+        id,
+        type,
+        title,
+        original_title AS originalTitle,
+        description,
+        year,
+        genre_json AS genreJson,
+        poster,
+        backdrop,
+        telegram_url AS telegramUrl,
+        youtube_url AS youtubeUrl,
+        facebook_url AS facebookUrl,
+        telegram_message_id AS telegramMessageId,
+        featured,
+        created_at AS createdAt,
+        updated_at AS updatedAt
+      FROM content
+      WHERE type = ?
+      ORDER BY updated_at DESC, title ASC
+    `
+    : `
+      SELECT
+        id,
+        type,
+        title,
+        original_title AS originalTitle,
+        description,
+        year,
+        genre_json AS genreJson,
+        poster,
+        backdrop,
+        telegram_url AS telegramUrl,
+        youtube_url AS youtubeUrl,
+        facebook_url AS facebookUrl,
+        telegram_message_id AS telegramMessageId,
+        featured,
+        created_at AS createdAt,
+        updated_at AS updatedAt
+      FROM content
+      ORDER BY updated_at DESC, title ASC
+    `;
+
+  const statement = env.DB.prepare(query);
+
+  const result = normalizedType
+    ? await statement.bind(normalizedType).all()
+    : await statement.all();
+
+  return (result.results || []).map(
+    (row: any) => ({
+      id: row.id,
+      type: row.type,
+      title: row.title,
+      originalTitle:
+        row.originalTitle || undefined,
+      description:
+        row.description || undefined,
+      year:
+        row.year || undefined,
+      genre:
+        parseGenre(row.genreJson),
+      poster:
+        row.poster || DEFAULT_POSTER,
+      backdrop:
+        row.backdrop || undefined,
+      telegramUrl:
+        row.telegramUrl || undefined,
+      youtubeUrl:
+        row.youtubeUrl || undefined,
+      facebookUrl:
+        row.facebookUrl || undefined,
+      telegramMessageId:
+        row.telegramMessageId
+          ? Number(row.telegramMessageId)
+          : undefined,
+      featured:
+        Boolean(row.featured),
+      createdAt:
+        row.createdAt,
+      updatedAt:
+        row.updatedAt,
+    })
   );
 }
 
@@ -1057,32 +1195,83 @@ const telegramThumbnail =
     .run();
 
   /* =======================================================
-     MOVIE / SHORT NATOK
-
+     MOVIE / SHORT NATOK / VLOG / TRAILER
      IMPORTANT:
-     episodes table requires telegram_message_id.
-     episodes table does NOT have updated_at.
+     These standalone content types belong in the new
+     `content` table, not in `series` / `episodes`.
   ======================================================= */
 
   if (
     parsed.type === "movie" ||
-    parsed.type ===
-      "short_natok"
+    parsed.type === "short_natok" ||
+    parsed.type === "vlog" ||
+    parsed.type === "trailer"
   ) {
     const contentId =
-      `${seriesId}-content`;
+      `${parsed.type}-${slugify(parsed.title || parsed.series)}`;
+
+    const existingContent: any =
+      await env.DB.prepare(`
+        SELECT *
+        FROM content
+        WHERE id = ?
+        LIMIT 1
+      `)
+        .bind(contentId)
+        .first();
+
+    const contentGenreSource =
+      parsed.genre ??
+      existingContent?.genre_json;
+
+    const contentGenreJson =
+      JSON.stringify(
+        parseGenre(contentGenreSource)
+      );
+
+    const contentPoster =
+      parsed.poster ||
+      existingContent?.poster ||
+      telegramThumbnail ||
+      DEFAULT_POSTER;
+
+    const contentBackdrop =
+      parsed.backdrop ||
+      existingContent?.backdrop ||
+      null;
+
+    const contentDescription =
+      parsed.description ||
+      existingContent?.description ||
+      `${parsed.title || parsed.series} - Morfah Studios`;
+
+    const contentYear =
+      parsed.year ??
+      existingContent?.year ??
+      null;
+
+    const contentFeatured =
+      existingContent?.featured ??
+      0;
 
     await env.DB.prepare(`
-      INSERT INTO episodes (
+      INSERT INTO content (
         id,
-        series_id,
-        number,
+        type,
         title,
+        original_title,
+        description,
+        year,
+        genre_json,
+        poster,
+        backdrop,
         telegram_url,
         youtube_url,
         facebook_url,
         telegram_message_id,
-        created_at
+        featured,
+        created_at,
+        updated_at
       )
       VALUES (
         ?,
@@ -1093,48 +1282,66 @@ const telegramThumbnail =
         ?,
         ?,
         ?,
+        ?,
+        ?,
+        ?,
+        ?,
+        ?,
+        ?,
+        CURRENT_TIMESTAMP,
         CURRENT_TIMESTAMP
       )
       ON CONFLICT(id)
       DO UPDATE SET
+        type =
+          excluded.type,
         title =
           excluded.title,
-
+        description =
+          excluded.description,
+        year =
+          excluded.year,
+        genre_json =
+          excluded.genre_json,
+        poster =
+          excluded.poster,
+        backdrop =
+          excluded.backdrop,
         telegram_url =
           excluded.telegram_url,
-
-        telegram_message_id =
-          excluded.telegram_message_id,
-
         youtube_url =
           excluded.youtube_url,
-
         facebook_url =
-          excluded.facebook_url
+          excluded.facebook_url,
+        telegram_message_id =
+          excluded.telegram_message_id,
+        updated_at =
+          CURRENT_TIMESTAMP
     `)
       .bind(
         contentId,
-        seriesId,
-        1,
-        parsed.title,
-        telegramUrl(
-          env,
-          post
-        ),
+        parsed.type,
+        parsed.title || parsed.series,
+        existingContent?.original_title || null,
+        contentDescription,
+        contentYear,
+        contentGenreJson,
+        contentPoster,
+        contentBackdrop,
+        telegramUrl(env, post),
         parsed.youtube || null,
         parsed.facebook || null,
-        post.message_id
+        post.message_id,
+        contentFeatured
       )
       .run();
 
     return {
       imported: true,
-      type:
-        parsed.type,
-      id:
-        seriesId,
+      type: parsed.type,
+      id: contentId,
       title:
-        parsed.title,
+        parsed.title || parsed.series,
     };
   }
 
@@ -1348,6 +1555,199 @@ export default {
 
 
       /* =====================================================
+         API: CONTENT
+         Query examples:
+         /api/content
+         /api/content?type=short_natok
+         /api/content?type=movie
+         /api/content?type=vlog
+         /api/content?type=trailer
+      ===================================================== */
+
+      if (
+        request.method === "GET" &&
+        path === "/api/content"
+      ) {
+        const type =
+          url.searchParams
+            .get("type")
+            ?.trim()
+            .toLowerCase() || undefined;
+
+        const allowedTypes = new Set([
+          "movie",
+          "short_natok",
+          "vlog",
+          "trailer",
+        ]);
+
+        if (
+          type &&
+          !allowedTypes.has(type)
+        ) {
+          return json(
+            {
+              ok: false,
+              error: "Unsupported content type",
+              allowedTypes: [
+                "movie",
+                "short_natok",
+                "vlog",
+                "trailer",
+              ],
+            },
+            400
+          );
+        }
+
+        const result =
+          await contentCatalog(
+            env,
+            type
+          );
+
+        return json(result);
+      }
+
+
+      /* =====================================================
+         API: CONTENT SEARCH
+         Optional type filter.
+      ===================================================== */
+
+      if (
+        request.method === "GET" &&
+        path === "/api/content/search"
+      ) {
+        const q =
+          url.searchParams
+            .get("q")
+            ?.trim()
+            .toLowerCase() || "";
+
+        if (!q) {
+          return json([]);
+        }
+
+        const type =
+          url.searchParams
+            .get("type")
+            ?.trim()
+            .toLowerCase() || "";
+
+        const like = `%${q}%`;
+
+        const result =
+          type
+            ? await env.DB.prepare(`
+                SELECT
+                  id,
+                  type,
+                  title,
+                  original_title AS originalTitle,
+                  description,
+                  year,
+                  genre_json AS genreJson,
+                  poster,
+                  backdrop,
+                  telegram_url AS telegramUrl,
+                  youtube_url AS youtubeUrl,
+                  facebook_url AS facebookUrl,
+                  telegram_message_id AS telegramMessageId,
+                  featured,
+                  created_at AS createdAt,
+                  updated_at AS updatedAt
+                FROM content
+                WHERE type = ?
+                  AND (
+                    LOWER(title) LIKE ?
+                    OR LOWER(COALESCE(original_title, '')) LIKE ?
+                    OR LOWER(COALESCE(description, '')) LIKE ?
+                  )
+                ORDER BY updated_at DESC, title ASC
+                LIMIT 50
+              `)
+              .bind(
+                type,
+                like,
+                like,
+                like
+              )
+              .all()
+            : await env.DB.prepare(`
+                SELECT
+                  id,
+                  type,
+                  title,
+                  original_title AS originalTitle,
+                  description,
+                  year,
+                  genre_json AS genreJson,
+                  poster,
+                  backdrop,
+                  telegram_url AS telegramUrl,
+                  youtube_url AS youtubeUrl,
+                  facebook_url AS facebookUrl,
+                  telegram_message_id AS telegramMessageId,
+                  featured,
+                  created_at AS createdAt,
+                  updated_at AS updatedAt
+                FROM content
+                WHERE
+                  LOWER(title) LIKE ?
+                  OR LOWER(COALESCE(original_title, '')) LIKE ?
+                  OR LOWER(COALESCE(description, '')) LIKE ?
+                ORDER BY updated_at DESC, title ASC
+                LIMIT 50
+              `)
+              .bind(
+                like,
+                like,
+                like
+              )
+              .all();
+
+        return json(
+          (result.results || []).map(
+            (row: any) => ({
+              id: row.id,
+              type: row.type,
+              title: row.title,
+              originalTitle:
+                row.originalTitle || undefined,
+              description:
+                row.description || undefined,
+              year:
+                row.year || undefined,
+              genre:
+                parseGenre(row.genreJson),
+              poster:
+                row.poster || DEFAULT_POSTER,
+              backdrop:
+                row.backdrop || undefined,
+              telegramUrl:
+                row.telegramUrl || undefined,
+              youtubeUrl:
+                row.youtubeUrl || undefined,
+              facebookUrl:
+                row.facebookUrl || undefined,
+              telegramMessageId:
+                row.telegramMessageId
+                  ? Number(row.telegramMessageId)
+                  : undefined,
+              featured:
+                Boolean(row.featured),
+              createdAt:
+                row.createdAt,
+              updatedAt:
+                row.updatedAt,
+            })
+          )
+        );
+      }
+
+
+      /* =====================================================
          API: SINGLE SERIES
          
          IMPORTANT:
@@ -1527,7 +1927,7 @@ export default {
       /* =====================================================
          TELEGRAM POSTER PROXY
 
-         Uses the Telegram file_id stored in series.poster.
+         Uses the Telegram file_id stored in series.poster or content.poster.
       ===================================================== */
 
       if (
