@@ -993,6 +993,689 @@ async function searchCatalog(
 }
 
 
+
+/* =========================================================
+   SALAFI DAWAH TELEGRAM IMPORT
+   ========================================================= */
+
+type SalafiType =
+  | "speaker"
+  | "speaker_video"
+  | "course"
+  | "special_video"
+  | "live";
+
+type SalafiCaption = {
+  type: SalafiType;
+  speaker?: string;
+  collection?: string;
+  course?: string;
+  title: string;
+  description?: string;
+  youtube?: string;
+};
+
+function parseSalafiCaption(caption: string): SalafiCaption | null {
+  const lines = caption
+    .split(/\r?\n/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  if (
+    !lines.some(
+      (x) => /^salafi$/i.test(x) || /^#salafi$/i.test(x)
+    )
+  ) {
+    return null;
+  }
+
+  const get = (label: string) => {
+    const line = lines.find((x) =>
+      new RegExp(`^${label}\\s*:\\s*`, "i").test(x)
+    );
+    return (
+      line
+        ?.replace(new RegExp(`^${label}\\s*:\\s*`, "i"), "")
+        .trim() || ""
+    );
+  };
+
+  const typeRaw = get("Type").toLowerCase().replace(/[_-]+/g, " ").trim();
+
+  let type: SalafiType;
+  if (typeRaw === "speaker") type = "speaker";
+  else if (
+    typeRaw === "speaker video" ||
+    typeRaw === "video"
+  ) type = "speaker_video";
+  else if (typeRaw === "course") type = "course";
+  else if (
+    typeRaw === "special" ||
+    typeRaw === "special video"
+  ) type = "special_video";
+  else if (
+    typeRaw === "live" ||
+    typeRaw === "live programme" ||
+    typeRaw === "live program"
+  ) type = "live";
+  else return null;
+
+  const speaker = get("Speaker") || undefined;
+  const collection =
+    get("Series") ||
+    get("Collection") ||
+    undefined;
+  const course = get("Course") || undefined;
+  const title =
+    get("Title") ||
+    speaker ||
+    course ||
+    collection ||
+    "Salafi Dawah";
+
+  return {
+    type,
+    speaker,
+    collection,
+    course,
+    title,
+    description: get("Description") || undefined,
+    youtube: get("YouTube") || undefined,
+  };
+}
+
+async function ensureSalafiSpeaker(
+  env: Env,
+  name: string,
+  photoUrl?: string
+): Promise<number> {
+  const slug = slugify(name);
+
+  const existing = await env.DB.prepare(`
+    SELECT id, photo_url
+    FROM speakers
+    WHERE slug = ? OR name = ?
+    LIMIT 1
+  `)
+    .bind(slug, name)
+    .first<{ id: number; photo_url?: string }>();
+
+  if (existing?.id) {
+    if (photoUrl) {
+      await env.DB.prepare(`
+        UPDATE speakers
+        SET photo_url = ?
+        WHERE id = ?
+      `)
+        .bind(photoUrl, existing.id)
+        .run();
+    }
+    return Number(existing.id);
+  }
+
+  const inserted = await env.DB.prepare(`
+    INSERT INTO speakers (
+      slug,
+      name,
+      photo_url
+    )
+    VALUES (?, ?, ?)
+  `)
+    .bind(slug, name, photoUrl || null)
+    .run();
+
+  const row = await env.DB.prepare(`
+    SELECT id
+    FROM speakers
+    WHERE slug = ?
+    LIMIT 1
+  `)
+    .bind(slug)
+    .first<{ id: number }>();
+
+  if (!row?.id) {
+    throw new Error("Failed to create Salafi speaker");
+  }
+
+  return Number(row.id);
+}
+
+async function ensureSalafiCollection(
+  env: Env,
+  speakerId: number,
+  title: string
+): Promise<number> {
+  const slug = slugify(title);
+
+  const existing = await env.DB.prepare(`
+    SELECT id
+    FROM speaker_collections
+    WHERE speaker_id = ? AND slug = ?
+    LIMIT 1
+  `)
+    .bind(speakerId, slug)
+    .first<{ id: number }>();
+
+  if (existing?.id) {
+    return Number(existing.id);
+  }
+
+  await env.DB.prepare(`
+    INSERT INTO speaker_collections (
+      speaker_id,
+      title,
+      slug
+    )
+    VALUES (?, ?, ?)
+  `)
+    .bind(speakerId, title, slug)
+    .run();
+
+  const row = await env.DB.prepare(`
+    SELECT id
+    FROM speaker_collections
+    WHERE speaker_id = ? AND slug = ?
+    LIMIT 1
+  `)
+    .bind(speakerId, slug)
+    .first<{ id: number }>();
+
+  if (!row?.id) {
+    throw new Error("Failed to create Salafi collection");
+  }
+
+  return Number(row.id);
+}
+
+async function ensureSalafiCourse(
+  env: Env,
+  title: string
+): Promise<number> {
+  const slug = slugify(title);
+
+  const existing = await env.DB.prepare(`
+    SELECT id
+    FROM courses
+    WHERE slug = ?
+    LIMIT 1
+  `)
+    .bind(slug)
+    .first<{ id: number }>();
+
+  if (existing?.id) {
+    return Number(existing.id);
+  }
+
+  await env.DB.prepare(`
+    INSERT INTO courses (
+      title,
+      slug
+    )
+    VALUES (?, ?)
+  `)
+    .bind(title, slug)
+    .run();
+
+  const row = await env.DB.prepare(`
+    SELECT id
+    FROM courses
+    WHERE slug = ?
+    LIMIT 1
+  `)
+    .bind(slug)
+    .first<{ id: number }>();
+
+  if (!row?.id) {
+    throw new Error("Failed to create Salafi course");
+  }
+
+  return Number(row.id);
+}
+
+async function importSalafiPost(
+  env: Env,
+  post: TelegramPost
+) {
+  const parsed = parseSalafiCaption(post.caption ?? "");
+
+  if (!parsed) {
+    return {
+      handled: false,
+      ignored: true,
+      reason: "caption_not_salafi_or_invalid",
+    };
+  }
+
+  const configuredChannel = String(
+    env.TELEGRAM_CHANNEL_ID || ""
+  ).trim();
+
+  const incomingChannel = String(
+    post.chat?.id ?? ""
+  ).trim();
+
+  if (
+    configuredChannel &&
+    incomingChannel !== configuredChannel
+  ) {
+    return {
+      handled: false,
+      ignored: true,
+      reason: "wrong_channel",
+    };
+  }
+
+  const thumbnailFileId = getTelegramThumbnailFileId(post);
+  const thumbnail = thumbnailFileId
+    ? `/api/telegram/poster/${encodeURIComponent(thumbnailFileId)}`
+    : null;
+
+  const photoFileId =
+    post.photo?.[post.photo.length - 1]?.file_id;
+
+  const photoUrl = photoFileId
+    ? `/api/telegram/poster/${encodeURIComponent(photoFileId)}`
+    : null;
+
+  /* Speaker profile photo */
+  if (parsed.type === "speaker") {
+    if (!parsed.speaker || !photoUrl) {
+      return {
+        handled: true,
+        imported: false,
+        ignored: true,
+        reason: "speaker_photo_requires_speaker_and_photo",
+      };
+    }
+
+    const speakerId = await ensureSalafiSpeaker(
+      env,
+      parsed.speaker,
+      photoUrl
+    );
+
+    return {
+      handled: true,
+      imported: true,
+      type: "speaker",
+      speakerId,
+      speaker: parsed.speaker,
+      photoUrl,
+    };
+  }
+
+  /* Course */
+  let courseId: number | null = null;
+  if (parsed.course) {
+    courseId = await ensureSalafiCourse(
+      env,
+      parsed.course
+    );
+  }
+
+  /* Speaker */
+  let speakerId: number | null = null;
+  if (parsed.speaker) {
+    speakerId = await ensureSalafiSpeaker(
+      env,
+      parsed.speaker
+    );
+  }
+
+  /* Collection / Series */
+  let collectionId: number | null = null;
+  if (parsed.collection) {
+    if (!speakerId) {
+      return {
+        handled: true,
+        imported: false,
+        ignored: true,
+        reason: "collection_requires_speaker",
+      };
+    }
+
+    collectionId = await ensureSalafiCollection(
+      env,
+      speakerId,
+      parsed.collection
+    );
+  }
+
+  const isVideo =
+    Boolean(post.video) ||
+    Boolean(post.document) ||
+    Boolean(post.animation);
+
+  if (!isVideo) {
+    return {
+      handled: true,
+      imported: false,
+      ignored: true,
+      reason: "salafi_video_post_requires_video",
+    };
+  }
+
+  const telegramUrlValue = telegramUrl(env, post);
+  const chatId = String(post.chat?.id ?? "");
+
+  const existingPost = await env.DB.prepare(`
+    SELECT video_id
+    FROM telegram_posts
+    WHERE telegram_chat_id = ?
+      AND telegram_message_id = ?
+    LIMIT 1
+  `)
+    .bind(chatId, post.message_id)
+    .first<{ video_id: number }>();
+
+  const contentType =
+    parsed.type === "course"
+      ? "course"
+      : parsed.type === "special_video"
+        ? "special_video"
+        : parsed.type === "live"
+          ? "live"
+          : "speaker_video";
+
+  if (existingPost?.video_id) {
+    await env.DB.prepare(`
+      UPDATE speaker_videos
+      SET title = ?,
+          description = ?,
+          thumbnail = ?,
+          speaker_id = ?,
+          collection_id = ?,
+          course_id = ?,
+          telegram_url = ?,
+          youtube_url = ?,
+          content_type = ?
+      WHERE id = ?
+    `)
+      .bind(
+        parsed.title,
+        parsed.description || null,
+        thumbnail,
+        speakerId,
+        collectionId,
+        courseId,
+        telegramUrlValue,
+        parsed.youtube || null,
+        contentType,
+        existingPost.video_id
+      )
+      .run();
+
+    return {
+      handled: true,
+      imported: true,
+      updated: true,
+      type: contentType,
+      videoId: Number(existingPost.video_id),
+    };
+  }
+
+  await env.DB.prepare(`
+    INSERT INTO speaker_videos (
+      title,
+      description,
+      thumbnail,
+      speaker_id,
+      collection_id,
+      course_id,
+      telegram_url,
+      youtube_url,
+      content_type
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+    .bind(
+      parsed.title,
+      parsed.description || null,
+      thumbnail,
+      speakerId,
+      collectionId,
+      courseId,
+      telegramUrlValue,
+      parsed.youtube || null,
+      contentType
+    )
+    .run();
+
+  const video = await env.DB.prepare(`
+    SELECT id
+    FROM speaker_videos
+    WHERE telegram_url = ?
+    ORDER BY id DESC
+    LIMIT 1
+  `)
+    .bind(telegramUrlValue)
+    .first<{ id: number }>();
+
+  if (!video?.id) {
+    throw new Error("Failed to create Salafi video");
+  }
+
+  await env.DB.prepare(`
+    INSERT INTO telegram_posts (
+      telegram_chat_id,
+      telegram_message_id,
+      video_id
+    )
+    VALUES (?, ?, ?)
+    ON CONFLICT(
+      telegram_chat_id,
+      telegram_message_id
+    )
+    DO UPDATE SET
+      video_id = excluded.video_id
+  `)
+    .bind(chatId, post.message_id, video.id)
+    .run();
+
+  return {
+    handled: true,
+    imported: true,
+    type: contentType,
+    videoId: Number(video.id),
+    speakerId,
+    collectionId,
+    courseId,
+  };
+}
+
+async function salafiSpeakers(env: Env) {
+  const result = await env.DB.prepare(`
+    SELECT
+      s.id,
+      s.slug,
+      s.name,
+      s.photo_url AS photoUrl,
+      s.bio,
+      s.created_at AS createdAt,
+      COUNT(v.id) AS videoCount
+    FROM speakers s
+    LEFT JOIN speaker_videos v
+      ON v.speaker_id = s.id
+    GROUP BY s.id
+    ORDER BY s.name ASC
+  `).all();
+
+  return (result.results || []).map((row: any) => ({
+    id: Number(row.id),
+    slug: row.slug,
+    name: row.name,
+    photoUrl: row.photoUrl || undefined,
+    bio: row.bio || undefined,
+    createdAt: row.createdAt,
+    videoCount: Number(row.videoCount || 0),
+  }));
+}
+
+async function salafiCollections(
+  env: Env,
+  speakerId?: number
+) {
+  const result = speakerId
+    ? await env.DB.prepare(`
+        SELECT
+          c.id,
+          c.speaker_id AS speakerId,
+          c.title,
+          c.slug,
+          c.description,
+          c.cover_image AS coverImage,
+          COUNT(v.id) AS videoCount
+        FROM speaker_collections c
+        LEFT JOIN speaker_videos v
+          ON v.collection_id = c.id
+        WHERE c.speaker_id = ?
+        GROUP BY c.id
+        ORDER BY c.title ASC
+      `)
+        .bind(speakerId)
+        .all()
+    : await env.DB.prepare(`
+        SELECT
+          c.id,
+          c.speaker_id AS speakerId,
+          c.title,
+          c.slug,
+          c.description,
+          c.cover_image AS coverImage,
+          COUNT(v.id) AS videoCount
+        FROM speaker_collections c
+        LEFT JOIN speaker_videos v
+          ON v.collection_id = c.id
+        GROUP BY c.id
+        ORDER BY c.title ASC
+      `).all();
+
+  return (result.results || []).map((row: any) => ({
+    id: Number(row.id),
+    speakerId: Number(row.speakerId),
+    title: row.title,
+    slug: row.slug,
+    description: row.description || undefined,
+    coverImage: row.coverImage || undefined,
+    videoCount: Number(row.videoCount || 0),
+  }));
+}
+
+async function salafiCourses(env: Env) {
+  const result = await env.DB.prepare(`
+    SELECT
+      c.id,
+      c.title,
+      c.slug,
+      c.description,
+      c.cover_image AS coverImage,
+      c.created_at AS createdAt,
+      COUNT(v.id) AS videoCount
+    FROM courses c
+    LEFT JOIN speaker_videos v
+      ON v.course_id = c.id
+    GROUP BY c.id
+    ORDER BY c.title ASC
+  `).all();
+
+  return (result.results || []).map((row: any) => ({
+    id: Number(row.id),
+    title: row.title,
+    slug: row.slug,
+    description: row.description || undefined,
+    coverImage: row.coverImage || undefined,
+    createdAt: row.createdAt,
+    videoCount: Number(row.videoCount || 0),
+  }));
+}
+
+async function salafiVideos(
+  env: Env,
+  params: URLSearchParams
+) {
+  const speakerId = Number(params.get("speakerId") || 0);
+  const collectionId = Number(params.get("collectionId") || 0);
+  const courseId = Number(params.get("courseId") || 0);
+  const contentType = params.get("type")?.trim() || "";
+
+  const where: string[] = [];
+  const values: unknown[] = [];
+
+  if (speakerId) {
+    where.push("v.speaker_id = ?");
+    values.push(speakerId);
+  }
+
+  if (collectionId) {
+    where.push("v.collection_id = ?");
+    values.push(collectionId);
+  }
+
+  if (courseId) {
+    where.push("v.course_id = ?");
+    values.push(courseId);
+  }
+
+  if (contentType) {
+    where.push("v.content_type = ?");
+    values.push(contentType);
+  }
+
+  const whereSql = where.length
+    ? `WHERE ${where.join(" AND ")}`
+    : "";
+
+  const result = await env.DB.prepare(`
+    SELECT
+      v.id,
+      v.title,
+      v.description,
+      v.thumbnail,
+      v.speaker_id AS speakerId,
+      s.name AS speakerName,
+      v.collection_id AS collectionId,
+      c.title AS collectionTitle,
+      v.course_id AS courseId,
+      co.title AS courseTitle,
+      v.telegram_url AS telegramUrl,
+      v.youtube_url AS youtubeUrl,
+      v.content_type AS contentType,
+      v.created_at AS createdAt
+    FROM speaker_videos v
+    LEFT JOIN speakers s
+      ON s.id = v.speaker_id
+    LEFT JOIN speaker_collections c
+      ON c.id = v.collection_id
+    LEFT JOIN courses co
+      ON co.id = v.course_id
+    ${whereSql}
+    ORDER BY v.created_at DESC, v.id DESC
+    LIMIT 200
+  `)
+    .bind(...values)
+    .all();
+
+  return (result.results || []).map((row: any) => ({
+    id: Number(row.id),
+    title: row.title,
+    description: row.description || undefined,
+    thumbnail: row.thumbnail || undefined,
+    speakerId:
+      row.speakerId == null ? undefined : Number(row.speakerId),
+    speakerName: row.speakerName || undefined,
+    collectionId:
+      row.collectionId == null ? undefined : Number(row.collectionId),
+    collectionTitle: row.collectionTitle || undefined,
+    courseId:
+      row.courseId == null ? undefined : Number(row.courseId),
+    courseTitle: row.courseTitle || undefined,
+    telegramUrl: row.telegramUrl,
+    youtubeUrl: row.youtubeUrl || undefined,
+    contentType: row.contentType,
+    createdAt: row.createdAt,
+  }));
+}
+
 /* =========================================================
    IMPORT TELEGRAM POST
 ========================================================= */
@@ -1806,6 +2489,56 @@ export default {
       }
 
 
+
+      /* =====================================================
+         API: SALAFI DAWAH
+      ===================================================== */
+
+      if (
+        request.method === "GET" &&
+        path === "/api/salafi/speakers"
+      ) {
+        return json(await salafiSpeakers(env));
+      }
+
+      if (
+        request.method === "GET" &&
+        path === "/api/salafi/collections"
+      ) {
+        const speakerIdRaw =
+          url.searchParams.get("speakerId");
+        const speakerId =
+          speakerIdRaw ? Number(speakerIdRaw) : undefined;
+
+        return json(
+          await salafiCollections(
+            env,
+            speakerId && Number.isFinite(speakerId)
+              ? speakerId
+              : undefined
+          )
+        );
+      }
+
+      if (
+        request.method === "GET" &&
+        path === "/api/salafi/courses"
+      ) {
+        return json(await salafiCourses(env));
+      }
+
+      if (
+        request.method === "GET" &&
+        path === "/api/salafi/videos"
+      ) {
+        return json(
+          await salafiVideos(
+            env,
+            url.searchParams
+          )
+        );
+      }
+
       /* =====================================================
          API: TELEGRAM STATUS
       ===================================================== */
@@ -2059,6 +2792,18 @@ export default {
             ignored: true,
             reason:
               "no_channel_post",
+          });
+        }
+
+        // SALAFI posts are handled separately from MORFAH posts.
+        // This includes speaker profile photos and Salafi videos.
+        const salafiResult =
+          await importSalafiPost(env, post);
+
+        if (salafiResult.handled) {
+          return json({
+            ok: true,
+            ...salafiResult,
           });
         }
 
